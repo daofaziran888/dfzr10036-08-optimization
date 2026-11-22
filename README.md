@@ -16,7 +16,9 @@
 │   └── vite.config.ts        dev server 配置（open: false）
 ├── backend/                  FastAPI（Python） 后端
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
+│   ├── app/routers/handoff.py   合并批次确认/预演交接接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
+│   ├── app/services/handoff.py  合并批次确认记录与受理进度持久化
 │   ├── app/services/base.py     共享服务骨架
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
@@ -80,6 +82,26 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 小文件合并批次交接
+
+合并完成后的统计与快照过期预演，统一由 `app/services/handoff.py` 按
+「合并批次确认记录」持久化，路由前缀 `/api/compaction-handoff`：
+
+- **批次可追溯**：每条批次（`compaction_batch`）记录目标表、基准快照、计划文件、
+  实际替换文件与输入指纹；同一合并任务编号下计划/实际文件不同即视为不同批次。
+- **重送幂等**：指纹命中已存在批次时只累加「重送次数」，不修改实际替换范围、
+  不重复生成统计与预演，重送不能扩大已确认范围。
+- **受理进度独立持久化**：统计受理（`metric_progress`）与预演交接
+  （`expire_rehearsal`）分开存储；统计按实际替换文件数每批只记一次，
+  中断后 `GET /recover` 可从「预演待生成/待领取」继续交付未受理的一侧。
+- **预演一批一份**：每条可复核路径归属原批次；未领取的预演可重新安排，
+  领取后范围冻结、拒绝重排；领取接口同时返回其余可领取预演。
+- **下游口径**：流聚合（`metric_aggr`）按批次确认记录累计实际替换文件数，
+  快照过期（`expire_snap`）据此生成可领取清理预演，不再按任务「文件数量」推算。
+
+前端在「合并批次交接」页（`/compaction-handoff`）提供批次确认记录与
+预演领取队列工作台。
 
 领域：数据工程
 子方向：数仓与数据湖

@@ -1,9 +1,12 @@
 """冰山上层提交：提交完成后触发compaction小文件合并和expire_snap过期清理。"""
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.compaction import CompactionService
+from app.services.handoff import handoff_service
 from app.store import store
 
 
@@ -21,6 +24,9 @@ class IcebergCommitService(BaseModuleService):
         """Iceberg提交完成后触发compaction小文件合并和expire_snap过期快照清理。
 
         数据流链路: iceberg_commit -> compaction + expire_snap
+
+        合并结果不再就地累加任务的「文件数量」（重入会重复累计），而是按实际
+        替换文件生成可恢复的合并批次确认记录，统计与预演各自幂等持久化。
         """
         entry = self.get_entry(entry_id)
         if entry is None or entry.get("status") != "已提交":
@@ -29,10 +35,10 @@ class IcebergCommitService(BaseModuleService):
         table = str(entry.get("目标表", "unknown"))
         results: dict[str, Any] = {"compaction": None, "expire_snap": None}
 
-        # 检查文件数，触发 compaction
+        # 确保该表存在一个已完成的合并任务；已存在则复用，绝不修改其文件数量。
         comp_rows = store.rows("compaction")
-        existing_comp = [r for r in comp_rows if str(r.get("目标表", "")) == table]
-        if not existing_comp:
+        comp = next((row for row in comp_rows if str(row.get("目标表", "")) == table), None)
+        if comp is None:
             new_comp_id = max((int(r.get("id", 0)) for r in comp_rows), default=0) + 1
             comp = {
                 "id": new_comp_id,
@@ -49,21 +55,28 @@ class IcebergCommitService(BaseModuleService):
                 "abnormal": False,
             }
             comp_rows.append(comp)
-            results["compaction"] = comp
-        else:
-            existing_comp[0]["文件数量"] += 1
-            results["compaction"] = existing_comp[0]
+        results["compaction"] = comp
 
-        # 触发 expire_snap
-        exp_rows = store.rows("expire_snap")
-        existing_exp = [r for r in exp_rows if str(r.get("目标表", "")) == table]
-        if existing_exp:
-            existing_exp[0]["status"] = "生效中"
-            existing_exp[0]["pending"] = True
-            existing_exp[0]["abnormal"] = False
-            results["expire_snap"] = existing_exp[0]
-        else:
-            new_exp_id = max((int(r.get("id", 0)) for r in exp_rows), default=0) + 1
+        # 按本次提交实际替换的数据文件登记合并批次（指纹幂等，重入不重复累计）。
+        data_file = str(entry.get("数据文件", ""))
+        actual_name = os.path.basename(data_file).removesuffix(".parquet") or f"part-{entry_id}"
+        handoff = CompactionService().submit_compaction_batch(
+            int(comp["id"]),
+            {
+                "基准快照": str(entry.get("快照ID", f"snap-{entry_id}")),
+                "计划文件": [actual_name],
+                "实际替换文件": [actual_name],
+            },
+        )
+        results["batch"] = handoff["batch"]
+        results["rehearsal"] = handoff["rehearsal"]
+
+        for policy in store.rows("expire_snap"):
+            if str(policy.get("目标表", "")) == table:
+                results["expire_snap"] = policy
+                break
+        if results["expire_snap"] is None:
+            new_exp_id = max((int(r.get("id", 0)) for r in store.rows("expire_snap")), default=0) + 1
             expire = {
                 "id": new_exp_id,
                 "策略编号": f"EXPI-{new_exp_id:04d}",
@@ -71,16 +84,16 @@ class IcebergCommitService(BaseModuleService):
                 "保留数量": 10,
                 "保留天数": "7天",
                 "清理模式": "按快照时间过期",
-                "预演结果": f"待清理{new_exp_id * 2}个历史快照",
+                "预演结果": "待预演",
                 "下次执行": "2026-11-19 02:00:00",
                 "上次清理": "2026-11-18 02:00:00",
                 "status": "生效中",
                 "pending": True,
                 "abnormal": False,
             }
-            exp_rows.append(expire)
+            store.rows("expire_snap").append(expire)
             results["expire_snap"] = expire
-
+        handoff_service.upsert_metric(table)
         return results
 
     def handle_commit_conflict(self, entry_id: int) -> dict[str, Any] | None:
